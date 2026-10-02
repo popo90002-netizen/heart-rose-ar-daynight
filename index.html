@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Heart Marker - Rose Bloom AR</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  #status {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    color: #fff; font-family: sans-serif; font-size: 13px;
+    background: rgba(0,0,0,0.5); padding: 6px 14px; border-radius: 999px;
+    z-index: 1000; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="status">초기화 중...</div>
+<div id="container" style="width: 100vw; height: 100vh;"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+    "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js",
+    "fflate": "https://esm.sh/fflate@0.8.2"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { MindARThree } from 'mindar-image-three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const statusEl = document.getElementById('status');
+
+try {
+  const mindarThree = new MindARThree({
+    container: document.querySelector('#container'),
+    imageTargetSrc: './targets.mind',
+  });
+
+  const { renderer, scene, camera } = mindarThree;
+
+  scene.add(new THREE.AmbientLight(0xffffff, 2.6));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 2.8);
+  dirLight.position.set(1, 3, 2);
+  scene.add(dirLight);
+  const fillLight = new THREE.DirectionalLight(0xffe8e0, 1.6);
+  fillLight.position.set(-2, 1, -1);
+  scene.add(fillLight);
+
+  // 주간 6장 + 야간 1장, 총 7장으로 새로 컴파일된 파일이라 타겟 0~6 전부 준비
+  const anchors = [0, 1, 2, 3, 4, 5, 6].map(i => mindarThree.addAnchor(i));
+
+  const COLOR_VARIANTS = [
+    { name: 'red',    color: 0xffffff },
+    { name: 'pink',   color: 0xffb7cf },
+    { name: 'yellow', color: 0xffdf6b },
+    { name: 'white',  color: 0xffffff },
+  ];
+
+  // ------------------------------------------------------------
+  // 하트 바깥쪽 배치 좌표 (마커 평면 기준, 단위: 마커 가로폭 = 1)
+  // 규칙적으로 안 보이도록 각 위치에 약간의 랜덤 흔들림(jitter)을 더함
+  // ------------------------------------------------------------
+  // y값을 전체적으로 0.1만큼 낮춰서 조형물에 더 붙게 조정 (기존 대비)
+  const BASE_LAYOUT = [
+    { x: -0.24, y:  0.37, z: 0.05, scaleMul: 0.9,  delay: 0.0  },
+    { x:  0.24, y:  0.37, z: 0.05, scaleMul: 0.9,  delay: 0.25 },
+    { x: -0.51, y:  0.22, z: 0.05, scaleMul: 1.0,  delay: 0.5  },
+    { x:  0.51, y:  0.22, z: 0.05, scaleMul: 1.0,  delay: 0.75 },
+    { x: -0.60, y: -0.02, z: 0.05, scaleMul: 0.85, delay: 1.0  },
+    { x:  0.60, y: -0.02, z: 0.05, scaleMul: 0.85, delay: 1.25 },
+    { x: -0.51, y: -0.19, z: 0.05, scaleMul: 1.05, delay: 1.5  },
+    { x:  0.51, y: -0.19, z: 0.05, scaleMul: 1.05, delay: 1.75 },
+  ];
+  function jitter(n) { return (Math.random() - 0.5) * n; }
+  const LAYOUT = BASE_LAYOUT.map(pos => ({
+    x: pos.x + jitter(0.08),
+    y: pos.y + jitter(0.08),
+    z: pos.z + jitter(0.03),
+    // 크기 편차를 30%(0.85~1.15)에서 12%(0.94~1.06)로 줄여서 들쭉날쭉함 완화
+    scaleMul: pos.scaleMul * (0.94 + Math.random() * 0.12),
+    delay: pos.delay + jitter(0.2),
+  }));
+
+  const BLOOM_DURATION = 0.9;
+
+  function easeOutBack(t) {
+    const c1 = 1.70158, c3 = c1 + 1;
+    return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+  }
+
+  const anchorStates = anchors.map(a => {
+    const smoothGroup = new THREE.Group();
+    smoothGroup.visible = false;
+    scene.add(smoothGroup);
+    return { anchor: a, smoothGroup, roses: [], markerVisible: false, foundTime: null };
+  });
+
+  let modelReady = false;
+  let cameraReady = false;
+
+  function refreshIdleStatus() {
+    // 모델/카메라 둘 다 준비되기 전까지는 "대기중" 문구를 보여주지 않음
+    // (장미가 아직 안 실렸는데 '대기중'이라고 떠서 헷갈리는 문제 방지)
+    if (!cameraReady) return;
+    if (!modelReady) { statusEl.textContent = '장미 모델 로딩 중...'; return; }
+    statusEl.textContent = '마커 인식 대기 중...';
+  }
+
+  // ------------------------------------------------------------
+  // 장미 4종류를 모두 불러와서 장미 한 송이씩 랜덤으로 섞어 사용.
+  // rose.glb는 재질이 petal/leaf로 분리되어 있어 COLOR_VARIANTS로 색 틴트가 먹히고,
+  // 나머지(사진스캔 모델)는 이미 고유 색이 입혀져 있어 틴트 로직이 자동으로 無처리됨.
+  // ------------------------------------------------------------
+  // rotationFix: 이 모델의 "원래 자세"가 rose.glb 기준(줄기 아래, 꽃 위)과
+  // 다를 경우 여기서 라디안 단위로 보정. 전부 스캔 모델이라 축이 제각각일 수 있어
+  // 일단 0으로 두고, 실제로 확인한 뒤 수치를 채워 넣을 예정 (예: 90도 돌아가 있으면
+  // Math.PI/2 를 x/y/z 중 해당 축에 넣으면 됨).
+  // sizeMul: 전체 키(줄기+꽃) 기준으로만 맞추면 꽃송이 자체 비율이 다른 스캔
+  // 모델들이 상대적으로 너무 커 보이는 문제가 있어서, 빨간 장미(rose.glb)의
+  // "꽃송이 크기"를 기준으로 추가 보정한 배율. (줄기가 짧고 꽃이 큰 모델일수록
+  // 작게 조정됨)
+  const MODEL_SOURCES = [
+    { src: './rose.glb',  rotationFix: { x: 0, y: 0, z: 0 },                              sizeMul: 1.0  },
+    { src: './rose2.glb', rotationFix: { x: 0.1899, y: -0.0922, z: -0.9017 },              sizeMul: 0.68 },
+    { src: './rose3.glb', rotationFix: { x: -0.4949, y: 0.5999, z: -1.7718 },              sizeMul: 0.72 },
+    { src: './rose4.glb', rotationFix: { x: -0.1682, y: 0.0129, z: -0.153 },               sizeMul: 0.95 },
+  ];
+  const loader = new GLTFLoader();
+  const loadedModels = []; // { scene, autoScale, rotationFix }
+
+  Promise.all(MODEL_SOURCES.map(({ src, rotationFix, sizeMul }) => new Promise((resolve) => {
+    loader.load(src, (gltf) => {
+      const sceneRoot = gltf.scene;
+      const box = new THREE.Box3().setFromObject(sceneRoot);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const autoScale = (0.32 / (size.y || 1)) * sizeMul;
+      resolve({ scene: sceneRoot, autoScale, rotationFix });
+    }, undefined, (err) => {
+      console.error('GLB load error (' + src + '):', err);
+      resolve(null); // 하나 실패해도 나머지로 계속 진행
+    });
+  }))).then(results => {
+    results.forEach(r => { if (r) loadedModels.push(r); });
+    if (loadedModels.length === 0) {
+      statusEl.textContent = '모델 로드 실패';
+      return;
+    }
+    startLoadingRoses();
+    modelReady = true;
+    refreshIdleStatus();
+  });
+
+  function startLoadingRoses() {
+    anchorStates.forEach(state => {
+      LAYOUT.forEach(pos => {
+        const group = new THREE.Group();
+
+        const picked = loadedModels[Math.floor(Math.random() * loadedModels.length)];
+        const instance = picked.scene.clone(true);
+
+        // 모델별 고정 자세 보정(한 번만 적용, 이후 애니메이션은 바깥 group에서만 돌아감)
+        instance.rotation.set(picked.rotationFix.x, picked.rotationFix.y, picked.rotationFix.z);
+
+        const variant = COLOR_VARIANTS[Math.floor(Math.random() * COLOR_VARIANTS.length)];
+
+        instance.traverse(child => {
+          if (child.isMesh && child.material) {
+            const nameLower = (child.name + ' ' + (child.material.name || '')).toLowerCase();
+            if (nameLower.includes('petal')) {
+              child.material = child.material.clone();
+              child.material.color.setHex(variant.color);
+            }
+          }
+        });
+
+        group.add(instance);
+        group.position.set(pos.x, pos.y, pos.z);
+        group.scale.setScalar(0.0001);
+        state.smoothGroup.add(group);
+
+        state.roses.push({
+          group,
+          targetScale: picked.autoScale * pos.scaleMul,
+          delay: pos.delay,
+          spawned: false,
+          startTime: null,
+          tiltPhase: Math.random() * Math.PI * 2,
+          tiltSpeed: 0.00035 + Math.random() * 0.00025,
+          spinSpeed: 0.0025 + Math.random() * 0.0025,
+          bobPhase: Math.random() * Math.PI * 2,
+          bobSpeed: 0.0008 + Math.random() * 0.0006,
+        });
+      });
+    });
+  }
+
+  anchorStates.forEach(state => {
+    state.anchor.onTargetFound = () => {
+      state.markerVisible = true;
+      state.justFound = true;
+      state.smoothGroup.visible = true;
+      state.foundTime = performance.now();
+      statusEl.textContent = modelReady ? '하트 인식됨 - 장미가 피어납니다' : '하트 인식됨 - 장미 로딩 중...';
+      state.roses.forEach(r => { r.spawned = false; r.startTime = null; });
+    };
+    state.anchor.onTargetLost = () => {
+      state.markerVisible = false;
+      refreshIdleStatus();
+      state.roses.forEach(r => { r.group.scale.setScalar(0.0001); r.spawned = false; });
+    };
+  });
+
+  const start = async () => {
+    statusEl.textContent = '카메라 시작 중...';
+    try {
+      await mindarThree.start();
+    } catch (startErr) {
+      statusEl.textContent = '카메라 시작 실패: ' + startErr.message;
+      console.error(startErr);
+      return;
+    }
+
+    cameraReady = true;
+    refreshIdleStatus();
+
+    renderer.setAnimationLoop(() => {
+      let needsUpdate = false;
+      if (!camera.fov || camera.fov < 1) { camera.fov = 60; needsUpdate = true; }
+      const correctAspect = window.innerWidth / window.innerHeight;
+      if (!camera.aspect || Math.abs(camera.aspect - correctAspect) > 0.01) {
+        camera.aspect = correctAspect;
+        needsUpdate = true;
+      }
+      if (needsUpdate) camera.updateProjectionMatrix();
+
+      const now = performance.now();
+      scene.updateMatrixWorld(true);
+
+      if (modelReady) {
+        anchorStates.forEach(state => {
+          if (!state.markerVisible) return;
+
+          const targetPos = new THREE.Vector3();
+          const targetQuat = new THREE.Quaternion();
+          const targetScale = new THREE.Vector3();
+          state.anchor.group.matrixWorld.decompose(targetPos, targetQuat, targetScale);
+
+          if (state.justFound) {
+            state.smoothGroup.position.copy(targetPos);
+            state.smoothGroup.quaternion.copy(targetQuat);
+            state.smoothGroup.scale.copy(targetScale);
+            state.justFound = false;
+          } else {
+            const SMOOTH = 0.06;
+            state.smoothGroup.position.lerp(targetPos, SMOOTH);
+            state.smoothGroup.quaternion.slerp(targetQuat, SMOOTH);
+            state.smoothGroup.scale.lerp(targetScale, SMOOTH);
+          }
+
+          state.roses.forEach(r => {
+            if (!r.spawned) {
+              const elapsedSinceFound = (now - state.foundTime) / 1000;
+              if (elapsedSinceFound >= r.delay) {
+                r.spawned = true;
+                r.startTime = now;
+              }
+            }
+            if (r.spawned) {
+              const t = Math.min(1, (now - r.startTime) / 1000 / BLOOM_DURATION);
+              const eased = easeOutBack(t);
+
+              const bob = t >= 1 ? Math.sin(now * r.bobSpeed + r.bobPhase) * 0.04 : 0;
+              r.group.scale.setScalar(Math.max(0.0001, r.targetScale * eased * (1 + bob)));
+
+              r.group.rotation.y += r.spinSpeed;
+
+              const TOP_TILT = Math.PI / 2.3;
+              const ANGLE_TILT = -Math.PI / 7;
+              const blend = (Math.sin(now * r.tiltSpeed + r.tiltPhase) + 1) / 2;
+              r.group.rotation.x = TOP_TILT + (ANGLE_TILT - TOP_TILT) * blend;
+            }
+          });
+        });
+      }
+
+      renderer.render(scene, camera);
+    });
+  };
+
+  start();
+
+} catch (err) {
+  statusEl.textContent = '오류: ' + err.message;
+  console.error(err);
+}
+</script>
+
+</body>
+</html>
